@@ -21,67 +21,77 @@
 
 import os, glob
 import numpy as np
-from human_body_prior.tools.configurations import load_config, dump_config
-import os.path as osp
 
-def exprdir2model(expr_dir):
+
+def expid2model(expr_dir):
+    from configer import Configer
 
     if not os.path.exists(expr_dir): raise ValueError('Could not find the experiment directory: %s' % expr_dir)
 
-    model_snapshots_dir = osp.join(expr_dir, 'snapshots')
-    available_ckpts = sorted(glob.glob(osp.join(model_snapshots_dir, '*.ckpt')), key=osp.getmtime)
-    assert len(available_ckpts) > 0, ValueError('No checck points found at {}'.format(model_snapshots_dir))
-    trained_weigths_fname = available_ckpts[-1]
+    best_model_fname = sorted(glob.glob(os.path.join(expr_dir, 'snapshots', '*.pt')), key=os.path.getmtime)[-1]
+    try_num = os.path.basename(best_model_fname).split('_')[0]
 
-    model_ps_fname = glob.glob(osp.join('/', '/'.join(trained_weigths_fname.split('/')[:-2]), '*.yaml'))
-    if len(model_ps_fname) == 0:
-        model_ps_fname = glob.glob(osp.join('/'.join(trained_weigths_fname.split('/')[:-2]), '*.yaml'))
+    print(('Found Trained Model: %s' % best_model_fname))
 
-    model_ps_fname = model_ps_fname[0]
-    model_ps = load_config(default_ps_fname=model_ps_fname)
+    default_ps_fname = glob.glob(os.path.join(expr_dir,'*.ini'))[0]
+    if not os.path.exists(
+        default_ps_fname): raise ValueError('Could not find the appropriate vposer_settings: %s' % default_ps_fname)
+    ps = Configer(default_ps_fname=default_ps_fname, work_dir = expr_dir, best_model_fname=best_model_fname)
 
-    model_ps.logging.best_model_fname = trained_weigths_fname
+    return ps, best_model_fname
 
-    return model_ps, trained_weigths_fname
-
-
-def load_model(expr_dir, model_code=None, remove_words_in_model_weights=None, load_only_ps=False, disable_grad=True, custom_ps = None):
+def load_vposer(expr_dir, vp_model='snapshot'):
     '''
 
     :param expr_dir:
-    :param model_code: an imported module
-    from supercap.train.supercap_smpl import SuperCap, then pass SuperCap to this function
+    :param vp_model: either 'snapshot' to use the experiment folder's code or a VPoser imported module, e.g.
+    from human_body_prior.train.vposer_smpl import VPoser, then pass VPoser to this function
     :param if True will load the model definition used for training, and not the one in current repository
     :return:
     '''
     import importlib
+    import os
     import torch
 
-    model_ps, trained_weigths_fname = exprdir2model(expr_dir)
-    if load_only_ps: return model_ps
-    if custom_ps is not None: model_ps = custom_ps
-    assert model_code is not None, ValueError('mode_code should be provided')
-    model_instance = model_code(model_ps)
-    if disable_grad: # i had to do this. torch.no_grad() couldnt achieve what i was looking for
-        for param in model_instance.parameters():
-            param.requires_grad = False
-    state_dict = torch.load(trained_weigths_fname)['state_dict']
-    if remove_words_in_model_weights is not None:
-        words = '{}'.format(remove_words_in_model_weights)
-        state_dict = {k.replace(words, '') if k.startswith(words) else k: v for k, v in state_dict.items()}
+    ps, trained_model_fname = expid2model(expr_dir)
+    if vp_model == 'snapshot':
 
-    ## keys that were in the model trained file and not in the current model
-    instance_model_keys = list(model_instance.state_dict().keys())
-    trained_model_keys = list(state_dict.keys())
-    wts_in_model_not_in_file = set(instance_model_keys).difference(set(trained_model_keys))
-    ## keys that are in the current model not in the training weights
-    wts_in_file_not_in_model = set(trained_model_keys).difference(set(instance_model_keys))
-    # assert len(wts_in_model_not_in_file) == 0, ValueError('Some model weights are not present in the pretrained file. {}'.format(wts_in_model_not_in_file))
+        vposer_path = sorted(glob.glob(os.path.join(expr_dir, 'vposer_*.py')), key=os.path.getmtime)[-1]
 
-    state_dict = {k:v for k, v in state_dict.items() if k in instance_model_keys}
-    model_instance.load_state_dict(state_dict, strict=False) # Todo fix the issues so that we can set the strict to true. The body model uses unnecessary registered buffers
-    model_instance.eval()
+        spec = importlib.util.spec_from_file_location('VPoser', vposer_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
 
-    return model_instance, model_ps
+        vposer_pt = getattr(module, 'VPoser')(num_neurons=ps.num_neurons, latentD=ps.latentD, data_shape=ps.data_shape)
+    else:
+        vposer_pt = vp_model(num_neurons=ps.num_neurons, latentD=ps.latentD, data_shape=ps.data_shape)
+
+    vposer_pt.load_state_dict(torch.load(trained_model_fname, map_location='cpu'))
+    vposer_pt.eval()
+
+    return vposer_pt, ps
 
 
+def extract_weights_asnumpy(exp_id, vp_model= False):
+    from human_body_prior.tools.omni_tools import makepath
+    from human_body_prior.tools.omni_tools import copy2cpu as c2c
+
+    vposer_pt, vposer_ps = load_vposer(exp_id, vp_model=vp_model)
+
+    save_wt_dir = makepath(os.path.join(vposer_ps.work_dir, 'weights_npy'))
+
+    weights = {}
+    for var_name, var in vposer_pt.named_parameters():
+        weights[var_name] = c2c(var)
+    np.savez(os.path.join(save_wt_dir,'vposerWeights.npz'), **weights)
+
+    print(('Dumped weights as numpy arrays to %s'%save_wt_dir))
+    return vposer_ps, weights
+
+if __name__ == '__main__':
+    from human_body_prior.tools.omni_tools import copy2cpu as c2c
+    expr_dir = '/ps/project/humanbodyprior/VPoser/smpl/pytorch/0020_06_amass'
+    from human_body_prior.train.vposer_smpl import VPoser
+    vposer_pt, ps = load_vposer(expr_dir, vp_model='snapshot')
+    pose = c2c(vposer_pt.sample_poses(10))
+    print(pose.shape)
