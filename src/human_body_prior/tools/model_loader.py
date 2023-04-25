@@ -42,7 +42,6 @@ def expid2model(expr_dir):
 
 def load_vposer(expr_dir, vp_model='snapshot'):
     '''
-
     :param expr_dir:
     :param vp_model: either 'snapshot' to use the experiment folder's code or a VPoser imported module, e.g.
     from human_body_prior.train.vposer_smpl import VPoser, then pass VPoser to this function
